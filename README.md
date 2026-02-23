@@ -3,279 +3,232 @@
 A FastAPI-based GPT chatbot with:
 
 - Tool calling (weather, KB search, grade calculator, live web lookup)
-- Streaming responses
-- Conversation memory
+- Streaming responses (`/chat`)
+- Conversation memory (short-term rolling window)
+- Long-term memory (extra credit, persisted facts)
 - Safety enforcement
 - Rate limiting
-- Structured logging
+- Structured logging + metrics
+- Structured JSON output endpoint (`/chat_json`) (extra credit)
 - 20-prompt evaluation harness
 
 ---
 
-# Project Structure
+## Project Structure
 
-```
-ChatBotBuild/
-├── app.py
-├── kb.md
-├── eval_prompts.json
-├── run_eval.py
-├── summarize_eval.py
-├── requirements.txt
-└── results/
-    ├── transcripts/
-    ├── eval_runs/
-    └── metrics.jsonl
-```
-
----
-
-# Installation & Setup
-
-## 1. Clone Repository
-
-```bash
-git clone https://github.com/FarmerSamuel-FS/ChatBotBuild.git
-cd ChatBotBuild
-```
+    ChatBotBuild/
+    ├── app.py
+    ├── kb.md
+    ├── eval_prompts.json
+    ├── run_eval.py
+    ├── summarize_eval.py
+    ├── requirements.txt
+    ├── pytest.ini
+    ├── tests/
+    └── results/
+        ├── transcripts/
+        ├── eval_runs/
+        ├── metrics.jsonl
+        └── ltm_facts.jsonl    (created at runtime if LTM_ENABLED=1)
 
 ---
 
-## 2. Create Virtual Environment
+## Installation & Setup
 
-```bash
-python -m venv venv
-source venv/bin/activate
-```
+### 1) Clone Repository
 
-Windows:
+    git clone https://github.com/FarmerSamuel-FS/ChatBotBuild.git
+    cd ChatBotBuild
 
-```bash
-venv\Scripts\activate
-```
+### 2) Create Virtual Environment
 
----
+    python -m venv venv
+    source venv/bin/activate
 
-## 3. Install Dependencies
+### 3) Install Dependencies
 
-```bash
-pip install -r requirements.txt
-```
+    pip install -r requirements.txt
 
-If installing manually:
+### 4) Create a .env File
 
-```bash
-pip install fastapi uvicorn openai httpx python-dotenv orjson pydantic
-```
+Create a `.env` file in the project root:
 
----
+    touch .env
 
-## 4. Create .env File
+Add the following (example values):
 
-Create a `.env` file in the root directory:
-
-```bash
-touch .env
-```
-
-Add the following:
-
-```
-OPENAI_API_KEY=your_openai_key_here
-OPENAI_MODEL=gpt-4o-mini
-TEMP=0.4
-EVAL_MODE=0
-MEMORY_WINDOW=12
-RATE_LIMIT_RPM=60
-LOG_DIR=results
-```
+    OPENAI_API_KEY=your_openai_key_here
+    OPENAI_MODEL=gpt-4o-mini
+    TEMP=0.4
+    EVAL_MODE=0
+    MEMORY_WINDOW=12
+    RATE_LIMIT_RPM=60
+    LOG_DIR=results
 
 ---
 
-# Run the Server
+## Run the Server
 
-```bash
-uvicorn app:app --reload
-```
+    uvicorn app:app --reload
 
-Open your browser:
+Open:
 
-```
-http://127.0.0.1:8000
-```
+    http://127.0.0.1:8000
 
 ---
 
-# Run Evaluation Suite
+## API Endpoints
 
-## Run All 20 Prompts
+### POST /chat (streaming text)
+
+Request body:
+
+    {
+      "conversation_id": "demo",
+      "user_message": "What are office hours?"
+    }
+
+Response: streamed plain text (token-by-token).
+
+### POST /chat_json (structured JSON)
+
+Same request body as `/chat`.
+
+Response shape:
+
+    {
+      "conversation_id": "demo",
+      "answer": "…",
+      "tool_calls": ["kb_search"],
+      "latency_ms": 1234,
+      "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+      "cost_usd": 0.00003,
+      "ltm_facts_used": ["Name: Sam"]
+    }
+
+---
+
+## Run Evaluation Suite
 
 Make sure the server is running first.
 
-```bash
-python run_eval.py
-```
+### Run All Prompts
+
+    python run_eval.py
 
 This generates:
 
-```
-results/transcripts/<conversation_id>.txt
-results/eval_runs/<conversation_id>.json
-results/metrics.jsonl
-```
+    results/transcripts/<conversation_id>.txt
+    results/eval_runs/<conversation_id>.json
+    results/metrics.jsonl
+
+### Summarize Results
+
+    python summarize_eval.py results/eval_runs/*.json
 
 ---
 
-## Summarize Results
+## Tools Implemented
 
-```bash
-python summarize_eval.py results/eval_runs/*.json
-```
+### get_weather
 
----
-
-# Example Evaluation Output
-
-```
-Total prompts: 20
-Success rate: 100.0%
-TS%: 100.0
-Latency (ms): avg = 1997 | p50 = 2261 | p95 = 3366 | max = 3698
-Guess/without-tools prompts: refusal behavior ✅
-```
-
----
-
-# Tools Implemented
-
-## get_weather
-
-- Uses Open-Meteo API
+- Uses Open-Meteo API (no key)
 - Returns temperature and wind speed
 
-## kb_search
+### kb_search
 
 Searches `kb.md` for:
 
 - Office hours
 - Grading percentages
 
-## calculate_grade
+### calculate_grade
 
 Weighted formula:
 
-```
-Projects: 60%
-Exams: 30%
-Participation: 10%
+    Projects: 60%
+    Exams: 30%
+    Participation: 10%
 
-Final = (P × 0.60) + (E × 0.30) + (Pa × 0.10)
-```
-
-## web_lookup
+### web_lookup
 
 - Current US President → USA.gov
-- Other live facts → DuckDuckGo API
+- Other live facts → DuckDuckGo Instant Answer API
 
 ---
 
-# Safety Enforcement
+## Safety Enforcement
 
-Automatic refusal for:
+Automatic refusal / safe handling for:
 
 - Explosives / bomb instructions
 - Self-harm content (returns crisis resources)
 - Secret/API key storage
 - Guess-without-tools prompts
 
+Secrets are redacted in logs.
+
 ---
 
-# Memory
+## Memory
 
-Conversation history stored per `conversation_id`.
+### Short-term memory
+
+Conversation history stored per `conversation_id` (rolling `MEMORY_WINDOW` messages).
+
+### Long-term memory (extra credit)
+
+If enabled (`LTM_ENABLED=1`), the server stores simple “facts” (example: name, major)
+in:
+
+    results/ltm_facts.jsonl
 
 Example:
 
-```
-User: Remember my name is Sam.
-User: What is my name?
-Bot: Your name is Sam.
-```
+    User: Remember that my name is Sam.
+    User: What is my name?
+    Bot: Your name is Sam.
 
 ---
 
-# Knowledge Base (kb.md)
+## Metrics Logging
 
-```
-## Office Hours
-Mon–Thu 2–4pm, Room 301
+Each request appends a JSON line into:
 
-## Grading
-Projects: 60%
-Exams: 30%
-Participation: 10%
-```
+    results/metrics.jsonl
 
----
-
-# Metrics Logging
-
-Each request logs:
+Fields include:
 
 - latency_ms
 - tool_calls
 - token usage
-- timestamp
-
-Saved in:
-
-```
-results/metrics.jsonl
-```
+- cost_usd (if configured)
+- ltm_used (facts retrieved)
 
 ---
 
-# Full Workflow
-
-```bash
-# Start server
-uvicorn app:app --reload
-
-# Run evaluation
-python run_eval.py
-
-# Summarize results
-python summarize_eval.py results/eval_runs/*.json
-```
-
----
-
-# Tech Stack
+## Tech Stack
 
 - Python 3.10+
 - FastAPI
-- OpenAI API
+- OpenAI API (Python SDK)
 - HTTPX
 - Uvicorn
 - python-dotenv
 - orjson
-- Pydantic
+- pytest
 
 ---
 
-# Assignment Coverage
+## Assignment Coverage Checklist
 
-- Tool usage
-- Memory
-- Streaming responses
+- Tool usage (function calling)
+- Conversation state (memory)
+- Streaming responses (`/chat`)
 - Safety enforcement
-- Evaluation harness
-- Latency tracking
-- Structured logging
-- Policy correctness checks
+- Rate limiting
+- Metrics logging (latency, tokens, cost estimate)
+- Evaluation harness (20 prompts)
+- long-term memory + structured JSON output (`/chat_json`)
 
 ---
-
-# Author
-
-Week 2 Production Chatbot Assignment

@@ -29,6 +29,16 @@ MEMORY_WINDOW = int(os.getenv("MEMORY_WINDOW", "12"))
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "60"))
 LOG_DIR = os.getenv("LOG_DIR", "results")
 
+#cost/token logging (optional)
+
+MODEL_INPUT_COST_PER_1K = float(os.getenv("MODEL_INPUT_COST_PER_1K", "0"))
+MODEL_OUTPUT_COST_PER_1K = float(os.getenv("MODEL_OUTPUT_COST_PER_1K", "0"))
+
+#long-term memory 
+# Turn on/off with LTM_ENABLED=1/0 in .env
+LTM_ENABLED = os.getenv("LTM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+LTM_PATH = os.path.join(LOG_DIR, "ltm_facts.jsonl")
+
 SYSTEM_PROMPT = (
     "You are a task-oriented assistant.\n"
     "Use tools when they help, and don't guess if a tool can answer.\n"
@@ -75,6 +85,21 @@ def rate_limit(ip: str) -> None:
     if len(RATE[ip]) >= RATE_LIMIT_RPM:
         raise HTTPException(status_code=429, detail="Rate limit exceeded (RPM).")
     RATE[ip].append(now)
+
+def estimate_cost_usd(usage: Dict[str, Any]) -> Optional[float]:
+    """
+    Extra credit: simple cost estimate from token usage.
+    Only works if MODEL_INPUT_COST_PER_1K / MODEL_OUTPUT_COST_PER_1K are set.
+    """
+    if not usage:
+        return None
+    if MODEL_INPUT_COST_PER_1K <= 0 and MODEL_OUTPUT_COST_PER_1K <= 0:
+        return None
+
+    pt = float(usage.get("prompt_tokens") or 0)
+    ct = float(usage.get("completion_tokens") or 0)
+    cost = (pt / 1000.0) * MODEL_INPUT_COST_PER_1K + (ct / 1000.0) * MODEL_OUTPUT_COST_PER_1K
+    return round(cost, 8)
 
 
 # Tools
@@ -350,8 +375,94 @@ def log_jsonl(path: str, record: Dict[str, Any]) -> None:
     with open(path, "ab") as f:
         f.write(orjson.dumps(record) + b"\n")
 
+#long-term memory helpers
+FACT_PATTERNS = [
+    re.compile(r"\bremember that my name is\s+([A-Za-z][A-Za-z '\-]{0,40})\b", re.I),
+    re.compile(r"\bmy name is\s+([A-Za-z][A-Za-z '\-]{0,40})\b", re.I),
+    re.compile(r"\bremember that my major is\s+([A-Za-z][A-Za-z '\-]{0,60})\b", re.I),
+    re.compile(r"\bmy major is\s+([A-Za-z][A-Za-z '\-]{0,60})\b", re.I),
+]
+
+def extract_facts(text: str) -> List[str]:
+    """
+    Pull out simple facts from the user message.
+    This is intentionally basic for a student project.
+    """
+    facts: List[str] = []
+    t = (text or "").strip()
+    for pat in FACT_PATTERNS:
+        m = pat.search(t)
+        if not m:
+            continue
+        val = (m.group(1) or "").strip()
+        if not val:
+            continue
+        if "name" in pat.pattern.lower():
+            facts.append(f"Name: {val}")
+        elif "major" in pat.pattern.lower():
+            facts.append(f"Major: {val}")
+    # Remove duplicates while keeping order
+    seen = set()
+    out: List[str] = []
+    for fct in facts:
+        if fct not in seen:
+            seen.add(fct)
+            out.append(fct)
+    return out
+
+def ltm_add_facts(conversation_id: str, facts: List[str]) -> None:
+    if not LTM_ENABLED:
+        return
+    if not facts:
+        return
+    os.makedirs(os.path.dirname(LTM_PATH), exist_ok=True)
+    with open(LTM_PATH, "ab") as f:
+        for fact in facts:
+            rec = {"ts": time.time(), "conversation_id": conversation_id, "fact": fact}
+            f.write(orjson.dumps(rec) + b"\n")
+
+def ltm_search(conversation_id: str, query: str, limit: int = 5) -> List[str]:
+    """
+    Naive “search” over stored facts (keyword match).
+    Works well for: “What is my name and major?”
+    """
+    if not LTM_ENABLED:
+        return []
+    if not os.path.exists(LTM_PATH):
+        return []
+
+    q = (query or "").lower().strip()
+    if not q:
+        return []
+
+    hits: List[str] = []
+    try:
+        with open(LTM_PATH, "rb") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = orjson.loads(line)
+                except Exception:
+                    continue
+                if rec.get("conversation_id") != conversation_id:
+                    continue
+                fact = str(rec.get("fact") or "")
+                if not fact:
+                    continue
+                # Match either by query words 
+                if q in fact.lower():
+                    hits.append(fact)
+                elif re.search(r"\b(name|major)\b", q) and re.search(r"\b(Name|Major)\b", fact):
+                    hits.append(fact)
+    except Exception:
+        return [] 
+    return hits[-limit:]
+
 
 # Simple tool router
+
 WEATHER_RE = re.compile(r"\b(weather|temperature|forecast)\b", re.I)
 KB_RE = re.compile(r"\b(office hours|office|grading|grades?|percent|percentage|rubric|points|weight|weights)\b", re.I)
 SCORE_WORDS_RE = re.compile(r"\b(project|projects|exam|exams|participation)\b", re.I)
@@ -370,7 +481,7 @@ def choose_forced_tool(user_text: str) -> Optional[str]:
     if PROFILE_SET_RE.search(t):
         return None
 
-    # 2) If user says "without tools" / "guess", do NOT force tools 
+    # 2) If user says "without tools" / "guess", do NOT force tools
     if re.search(r"\b(without tools|no tools|guess)\b", tl):
         return None
 
@@ -685,6 +796,18 @@ class ChatIn(BaseModel):
     user_message: str
 
 
+#structured JSON output schema
+# This is a second endpoint so /chat can stay streaming text.
+class ChatOut(BaseModel):
+    conversation_id: str
+    answer: str
+    tool_calls: List[str]
+    latency_ms: int
+    usage: Dict[str, Any]
+    cost_usd: Optional[float] = None
+    ltm_facts_used: List[str] = []
+
+
 # Tool call round
 async def run_tool_round(
     messages: List[Dict[str, Any]],
@@ -777,6 +900,28 @@ def stream_answer(messages: List[Dict[str, Any]]):
         if delta and getattr(delta, "content", None):
             yield delta.content
 
+def non_stream_answer(messages: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+    """
+    non-stream answer helper (used by /chat_json).
+    """
+    client = get_client()
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        tools=TOOL_SPECS,
+        tool_choice="none",
+        temperature=TEMP,
+    )
+    usage: Dict[str, Any] = {}
+    if getattr(resp, "usage", None):
+        usage = {
+            "prompt_tokens": resp.usage.prompt_tokens,
+            "completion_tokens": resp.usage.completion_tokens,
+            "total_tokens": resp.usage.total_tokens,
+        }
+    txt = (resp.choices[0].message.content or "").strip()
+    return txt, usage
+
 # Main endpoint
 @app.post("/chat")
 async def chat(inp: ChatIn, request: Request):
@@ -811,14 +956,31 @@ async def chat(inp: ChatIn, request: Request):
         )
         return StreamingResponse(iter([msg]), media_type="text/plain; charset=utf-8")
 
+    # capture “remember” facts into long-term memory 
+    facts = extract_facts(raw_text)
+    if facts:
+        ltm_add_facts(inp.conversation_id, facts)
+
     append_msg(inp.conversation_id, "user", user_text)
 
     async def gen():
         start = time.time()
         tools_used_all: List[str] = []
         usage_all: Dict[str, Any] = {}
+        ltm_used: List[str] = []
 
+        #retrieve facts and inject as context
         messages = convo_messages(inp.conversation_id)
+        if LTM_ENABLED:
+            ltm_used = ltm_search(inp.conversation_id, user_text, limit=5)
+            if ltm_used:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "Long-term memory facts (learned earlier):\n- " + "\n- ".join(ltm_used),
+                    }
+                )
+
         forced = choose_forced_tool(user_text)
 
         try:
@@ -856,6 +1018,8 @@ async def chat(inp: ChatIn, request: Request):
             append_msg(inp.conversation_id, "assistant", final_text)
 
         latency_ms = int((time.time() - start) * 1000)
+        cost_usd = estimate_cost_usd(usage_all)
+
         log_jsonl(
             f"{LOG_DIR}/metrics.jsonl",
             {
@@ -864,8 +1028,169 @@ async def chat(inp: ChatIn, request: Request):
                 "latency_ms": latency_ms,
                 "tool_calls": tools_used_all,
                 "usage": usage_all,
+                "cost_usd": cost_usd,
+                "ltm_used": ltm_used,
             },
         )
         yield f"\n\n[latency_ms={latency_ms}]"
 
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
+
+
+# structured output 
+@app.post("/chat_json", response_model=ChatOut)
+async def chat_json(inp: ChatIn, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    rate_limit(ip)
+
+    raw_text = inp.user_message or ""
+    user_text = redact_secrets(raw_text)
+
+    if is_self_harm(raw_text):
+        return ChatOut(
+            conversation_id=inp.conversation_id,
+            answer=(
+                "I'm really sorry you're feeling this way. You deserve support right now.\n\n"
+                "If you're in the U.S., you can call or text 988 (Suicide & Crisis Lifeline). "
+                "If you're outside the U.S., tell me your country and I can point you to a local number.\n\n"
+                "If you're in immediate danger, please call your local emergency number right now."
+            ),
+            tool_calls=[],
+            latency_ms=0,
+            usage={},
+            cost_usd=None,
+            ltm_facts_used=[],
+        )
+
+    if is_unsafe(raw_text):
+        return ChatOut(
+            conversation_id=inp.conversation_id,
+            answer="I'm sorry, but I can't assist with that.",
+            tool_calls=[],
+            latency_ms=0,
+            usage={},
+            cost_usd=None,
+            ltm_facts_used=[],
+        )
+
+    if SECRET_PATTERNS[0].search(raw_text):
+        return ChatOut(
+            conversation_id=inp.conversation_id,
+            answer="I can’t store API keys or secrets. Please remove it from the message (and rotate it if it was real).",
+            tool_calls=[],
+            latency_ms=0,
+            usage={},
+            cost_usd=None,
+            ltm_facts_used=[],
+        )
+
+# Enforce: if user asks to guess or says "without tools", do NOT guess.
+    if re.search(r"\b(without tools|no tools|guess)\b", raw_text, re.I):
+        return ChatOut(
+            conversation_id=inp.conversation_id,
+            answer=(
+                "I can’t guess that without using tools or the knowledge base.\n"
+                "If you want, ask normally (e.g., “What are our office hours?”) and I’ll look it up."
+            ),
+            tool_calls=[],
+            latency_ms=0,
+            usage={},
+            cost_usd=None,
+            ltm_facts_used=[],
+        )
+
+    # capture “remember” facts into long-term memory 
+    facts = extract_facts(raw_text)
+    if facts:
+        ltm_add_facts(inp.conversation_id, facts)
+
+    append_msg(inp.conversation_id, "user", user_text)
+
+    start = time.time()
+    tools_used_all: List[str] = []
+    usage_all: Dict[str, Any] = {}
+    ltm_used: List[str] = []
+
+    messages = convo_messages(inp.conversation_id)
+
+    if LTM_ENABLED:
+        ltm_used = ltm_search(inp.conversation_id, user_text, limit=5)
+        if ltm_used:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Long-term memory facts (learned earlier):\n- " + "\n- ".join(ltm_used),
+                }
+            )
+
+    forced = choose_forced_tool(user_text)
+
+    messages, used, usage = await run_tool_round(messages, forced)
+    tools_used_all.extend(used)
+    if usage:
+        usage_all = usage
+
+    extra = ""
+    lt = user_text.lower()
+    if ("grading" in lt or "percent" in lt) and "average" in lt:
+        extra = "If the user asked for the average of the three grading percentages, compute (60+30+10)/3 = 33.33% and include it."
+
+    messages.append(
+        {
+            "role": "user",
+            "content": "Please answer the last user message. If tool results are above, use them." + ((" " + extra) if extra else ""),
+        }
+    )
+
+    answer_txt, usage2 = non_stream_answer(messages)
+
+    # Merge usage if the second call returned something
+    if usage2:
+       
+        if usage_all:
+            usage_all = {
+                "prompt_tokens": int(usage_all.get("prompt_tokens", 0)) + int(usage2.get("prompt_tokens", 0)),
+                "completion_tokens": int(usage_all.get("completion_tokens", 0)) + int(usage2.get("completion_tokens", 0)),
+                "total_tokens": int(usage_all.get("total_tokens", 0)) + int(usage2.get("total_tokens", 0)),
+            }
+        else:
+            usage_all = usage2
+
+    if answer_txt:
+        append_msg(inp.conversation_id, "assistant", answer_txt)
+
+    latency_ms = int((time.time() - start) * 1000)
+    cost_usd = estimate_cost_usd(usage_all)
+
+    log_jsonl(
+        f"{LOG_DIR}/metrics.jsonl",
+        {
+            "ts": time.time(),
+            "conversation_id": inp.conversation_id,
+            "latency_ms": latency_ms,
+            "tool_calls": tools_used_all,
+            "usage": usage_all,
+            "cost_usd": cost_usd,
+            "ltm_used": ltm_used,
+            "mode": "chat_json",
+        },
+    )
+
+    return ChatOut(
+        conversation_id=inp.conversation_id,
+        answer=answer_txt,
+        tool_calls=tools_used_all,
+        latency_ms=latency_ms,
+        usage=usage_all,
+        cost_usd=cost_usd,
+        ltm_facts_used=ltm_used,
+    )
+
+# quick health check endpoint
+@app.get("/health")
+async def health():
+    return {"ok": True, "model": MODEL, "ltm_enabled": LTM_ENABLED}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
